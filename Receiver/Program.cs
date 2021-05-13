@@ -14,7 +14,7 @@ namespace Receiver
     using Microsoft.Data.SqlClient;
     using NServiceBus;
 
-    class Program
+    public class Program // : ServiceBase
     {
         private static IContainer _autofac;
         private static IEndpointInstance endpointInstance;
@@ -26,26 +26,41 @@ namespace Receiver
 
         static async Task Main()
         {
-            InitializeContainer();
-
             Console.Title = "Samples.RabbitMQ.SimpleReceiver";
-            var endpointConfiguration = new EndpointConfiguration("Samples.RabbitMQ.SimpleReceiver");
-            var transport = endpointConfiguration.UseTransport<RabbitMQTransport>();
-            transport.UseConventionalRoutingTopology();
-            transport.ConnectionString("host=localhost; user=guest; password=guest;");
-            endpointConfiguration.EnableInstallers();
-            endpointConfiguration.SendHeartbeatTo("Particular.Servicecontrol");
 
-            var connection = @"Data Source=.;Initial Catalog=OutboxRepro;User ID=sa;Password=Asdf1234!;Connect Timeout=30;Encrypt=False;TrustServerCertificate=False;ApplicationIntent=ReadWrite;MultiSubnetFailover=False";
-            var persistence = endpointConfiguration.UsePersistence<SqlPersistence>();
-            var subscriptions = persistence.SubscriptionSettings();
-            subscriptions.CacheFor(TimeSpan.FromMinutes(1));
-            persistence.SqlDialect<SqlDialect.MsSqlServer>();
-            persistence.ConnectionBuilder(
-                connectionBuilder: () =>
-                {
-                    return new SqlConnection(connection);
-                });
+            InitializeContainer();
+            await StartEndpoint().ConfigureAwait(false);
+            await ProcessInput().ConfigureAwait(false);
+
+            //using (var service = new Program())
+            //{
+            //    try
+            //    {
+            //        Console.CancelKeyPress += (sender, e) =>
+            //        {
+            //            Console.WriteLine("Stopping service....");
+            //            service.OnStop();
+            //            Environment.Exit(0);
+            //        };
+
+            //        service.OnStart(null);
+
+            //        await ProcessInput().ConfigureAwait(false);
+
+            //    }
+            //    catch (Exception ex)
+            //    {
+            //        Console.Write($"Error: {ex.Message}");
+            //        service.OnStop();
+            //    }
+            //}
+
+
+        }
+
+        static async Task StartEndpoint()
+        {
+            var endpointConfiguration = new EndpointConfiguration("Samples.RabbitMQ.SimpleReceiver");
 
 #pragma warning disable CS0618 // Type or member is obsolete
             endpointConfiguration.UseContainer<AutofacBuilder>(
@@ -55,18 +70,37 @@ namespace Receiver
                         customizations.ExistingLifetimeScope(_autofac);
                     });
 
-            endpointConfiguration.EnableOutbox();
+            var transport = endpointConfiguration.UseTransport<RabbitMQTransport>();
+            transport.UseConventionalRoutingTopology();
+            transport.ConnectionString("host=localhost; username=guest; password=guest;");
+            endpointConfiguration.EnableInstallers();
+            endpointConfiguration.SendHeartbeatTo("Particular.Servicecontrol", TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(15));
+
+            var connection = @"Data Source=.,1433;Initial Catalog=OutboxRepro;User ID=sa;Password=Asdf1234!;Connect Timeout=30;Encrypt=False;TrustServerCertificate=False;ApplicationIntent=ReadWrite;MultiSubnetFailover=False";
+            var tablePrefix = "Persistence_";
+
+            var persistence = endpointConfiguration.UsePersistence<SqlPersistence>();
+            persistence.TablePrefix(tablePrefix);
+
+            var subscriptions = persistence.SubscriptionSettings();
+            subscriptions.CacheFor(TimeSpan.FromMinutes(1));
+
+            persistence.SqlDialect<SqlDialect.MsSqlServer>();
+            persistence.ConnectionBuilder(() => new SqlConnection(connection));
+
+            endpointConfiguration.MakeInstanceUniquelyAddressable($"Callbacks-{Environment.MachineName}");
+            endpointConfiguration.EnableCallbacks();
+
+            var outboxSettings = endpointConfiguration.EnableOutbox();
+            outboxSettings.RunDeduplicationDataCleanupEvery(TimeSpan.FromSeconds(10));
 
             EnableUnitOfWork(endpointConfiguration);
 
             endpointConfiguration.DefineCriticalErrorAction(OnCriticalError);
 
-            endpointInstance = await Endpoint.Start(endpointConfiguration)
-                .ConfigureAwait(false);
-            await ProcessInput()
-                .ConfigureAwait(false);
-            await endpointInstance.Stop()
-                .ConfigureAwait(false);
+            endpointInstance = await Endpoint.Start(endpointConfiguration).ConfigureAwait(false);
+
+            IsRunning = true;
         }
 
         static void EnableUnitOfWork(EndpointConfiguration endpointConfiguration)
@@ -90,10 +124,10 @@ namespace Receiver
                 switch (input.Key)
                 {
                     case ConsoleKey.R:
-                        await StopRabbitMQ();
+                        await StopRabbitMQ().ConfigureAwait(false);
                         break;
                     case ConsoleKey.S:
-                        await StopSqlServer();
+                        await StopSqlServer().ConfigureAwait(false);
                         break;
                     case ConsoleKey.Escape:
                         return;
@@ -199,7 +233,7 @@ namespace Receiver
                     Console.WriteLine($"Restarting Endpoint attempt: {RestartAttempts}");
 
                     // Endpoint start-up will throw exception if it does not succeeed in starting up the endpoint.
-                    await Main();
+                    await StartEndpoint().ConfigureAwait(false);
 
                     Console.WriteLine($"Endpoint restarted successfully after {RestartAttempts} attempt(s).");
                 }
@@ -213,8 +247,8 @@ namespace Receiver
                 Console.WriteLine($"Unable to restart the endpoint: {ex.Message}");
             }
 
-            await Task.Delay(TimeSpan.FromSeconds(10));
-            await RestartEndpoint();
+            await Task.Delay(TimeSpan.FromSeconds(10)).ConfigureAwait(false);
+            await RestartEndpoint().ConfigureAwait(false);
         }
 
         static async Task OnCriticalError(ICriticalErrorContext endPointContext)
@@ -222,7 +256,7 @@ namespace Receiver
             var fatalMessage = $"The following critical error was encountered: {endPointContext.Error}\nEndpoint will now restart.";
             Console.WriteLine(fatalMessage);
 
-            await endPointContext.Stop();
+            await endPointContext.Stop().ConfigureAwait(false);
 
             /* Ednpoint critical error is triggered by several sources:
              *     1. Module queue
@@ -240,7 +274,7 @@ namespace Receiver
                     if (!IsRestarting)
                     {
                         IsRestarting = true;
-                        await endpointInstance?.Stop();
+                        await endpointInstance.Stop().ConfigureAwait(false);
                         await RestartEndpoint().ConfigureAwait(false);
                     }
                 }
@@ -257,5 +291,21 @@ namespace Receiver
                 }
             }
         }
+
+        //protected override void OnStart(string[] args)
+        //{
+        //    try
+        //    {
+        //        StartEndpoint().GetAwaiter().GetResult();
+        //    }
+        //    catch (Exception exception)
+        //    {
+        //        Console.WriteLine("Failed to start", exception);
+        //    }
+        //}
+        //protected override void OnStop()
+        //{
+        //    endpointInstance?.Stop().GetAwaiter().GetResult();
+        //}
     }
 }
